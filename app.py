@@ -1,247 +1,328 @@
-# app.py — ChatGPT 分享页对话提取器（后端：DOM优先 + __NEXT_DATA__/streaming 回退）
-import os, re, json, html as _html, urllib.parse as urlparse
-from typing import List, Dict, Any, Iterable
-import requests
-from flask import Flask, request, jsonify, render_template
-from bs4 import BeautifulSoup
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Single-file Flask app: ChatGPT Share Extractor
+- Serves a minimal HTML UI at "/"
+- API POST /api/extract { "url": "https://chatgpt.com/share/..." }
+- Server fetches the page with requests, parses out user/assistant messages, returns JSON
+Run:
+  pip install flask requests
+  python chatgpt_share_extractor_flask.py
+Open: http://127.0.0.1:5000/
+"""
+import os, re, json, socket, ipaddress, urllib.parse as urlparse
+from typing import List, Tuple, Dict
+from flask import Flask, request, jsonify, make_response, Response
 
-APP_NAME = "chatgpt-share-extractor"
-DEFAULT_ALLOWED = {"chatgpt.com", "chat.openai.com", "shareg.pt"}
+try:
+    import requests
+except Exception as e:
+    raise SystemExit("Please install dependencies first: pip install flask requests")
 
-app = Flask(__name__, template_folder="templates", static_folder="static")
+APP = Flask(__name__)
 
-# 可选：简单访问令牌
+# ======== Config ========
+USER_AGENT = os.environ.get("UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                   "Chrome/120.0.0.0 Safari/537.36")
+TIMEOUT = float(os.environ.get("TIMEOUT", 15))
+MAX_BYTES = int(os.environ.get("MAX_BYTES", 6_000_000))  # 6MB cap
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "").strip()
 
-# 允许的服务端抓取域名（避免被滥用做 SSRF）
-_env_hosts = os.environ.get("ALLOWED_HOSTS", "")
-ALLOWED_HOSTS = {h.strip().lower() for h in _env_hosts.split(",") if h.strip()} if _env_hosts.strip() else DEFAULT_ALLOWED
+# Optional allow-list for hosts (comma-separated). If empty, allow any public host.
+ENV_ALLOWED = os.environ.get("ALLOWED_HOSTS", "").strip()
+ALLOWED_HOSTS = {h.strip().lower() for h in ENV_ALLOWED.split(",") if h.strip()} if ENV_ALLOWED else None
 
-# 禁止内网 / 元数据网段
-PRIVATE_NET_RE = re.compile(
-    r"^(localhost|127\.0\.0\.1|0\.0\.0\.0|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+)$",
-    re.IGNORECASE,
-)
+# ======== Inline HTML (frontend) ========
+INDEX_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>ChatGPT 分享页对话提取器 · Flask</title>
+    <style>
+      :root{--bg:#0b0d10;--panel:#11161c;--ink:#e6e9ef;--muted:#9aa3af;--acc:#6ee7b7;--err:#ff6b6b;--border:#1f2937}
+      html,body{height:100%}body{margin:0;background:var(--bg);color:var(--ink);
+      font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Noto Sans,Helvetica,Arial}
+      .wrap{max-width:960px;margin:36px auto;padding:0 16px}
+      .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px 18px 10px;
+        box-shadow:0 8px 26px rgba(0,0,0,.25)}
+      h1{margin:0 0 8px;font-size:22px}
+      .sub{margin:0 0 16px;color:var(--muted)}
+      label{display:block;color:var(--muted);margin:.4rem 0 .25rem}
+      input[type=url]{width:100%;box-sizing:border-box;background:#0c1117;color:var(--ink);
+        border:1px solid var(--border);border-radius:10px;padding:12px 14px;outline:none}
+      .bar{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+      button{appearance:none;background:#0f141b;border:1px solid var(--border);color:var(--ink);
+        padding:10px 14px;border-radius:10px;cursor:pointer}
+      button.primary{background:linear-gradient(180deg,#1f2937,#0f172a);border-color:#223047}
+      button.accent{background:linear-gradient(180deg,#064e3b,#052e2f);border-color:#065f46;color:#d1fae5}
+      button[disabled]{opacity:.6;cursor:not-allowed}
+      .status{min-height:22px;color:var(--muted);margin-top:10px}
+      .status.err{color:var(--err)}
+      .results{margin-top:16px;display:grid;gap:10px}
+      .msg{background:#0a0f14;border:1px solid var(--border);border-radius:12px;padding:12px 14px}
+      .meta{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:12px;margin-bottom:6px}
+      .role{padding:2px 8px;border-radius:999px;font-weight:600}
+      .role.user{background:rgba(59,130,246,.15);color:#bfdbfe;border:1px solid #1d4ed8}
+      .role.assistant{background:rgba(16,185,129,.15);color:#bbf7d0;border:1px solid #065f46}
+      .txt{white-space:pre-wrap}
+      .toolbar{display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:8px}
+      .small{font-size:12px;color:var(--muted)}
+      footer{margin:18px 0;color:var(--muted);font-size:12px}
+      code.inline{background:#0c1218;border:1px solid var(--border);padding:2px 6px;border-radius:6px}
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>ChatGPT 分享页对话提取器</h1>
+        <p class="sub">后端使用 <code class="inline">requests</code> 拉取并解析。输入分享链接，例如：
+          <code class="inline">https://chatgpt.com/share/68e851b3-03c4-8002-9cfe-0f9b8d4f6d22</code></p>
+        <label for="url">分享链接（URL）</label>
+        <input id="url" type="url" placeholder="https://chatgpt.com/share/..." />
+        <div class="bar">
+          <button id="go" class="primary">提取对话</button>
+          <button id="clear">清空</button>
+          <span id="status" class="status"></span>
+        </div>
+        <div class="toolbar">
+          <button id="saveTxt" class="accent" disabled>下载 .txt</button>
+          <button id="saveJson" class="accent" disabled>下载 .json</button>
+          <span id="stats" class="small"></span>
+        </div>
+        <div id="results" class="results"></div>
+        <footer>如遇跨域问题，请确保从本服务同源访问；本工具不在浏览器侧跨域抓取。</footer>
+      </div>
+    </div>
+    <script>
+      const $ = s => document.querySelector(s);
+      const url = $('#url'), go = $('#go'), clearBtn = $('#clear'),
+            statusEl = $('#status'), results = $('#results'),
+            saveTxt = $('#saveTxt'), saveJson = $('#saveJson'), stats = $('#stats');
+      let lastData = [];
 
-def is_allowed_url(target: str) -> bool:
+      clearBtn.addEventListener('click', () => {
+        url.value = ''; results.innerHTML = ''; status(''); stats.textContent = '';
+        toggleDownloads(false);
+      });
+
+      go.addEventListener('click', async () => {
+        const u = (url.value || '').trim();
+        results.innerHTML = ''; status('处理中…'); stats.textContent = ''; toggleDownloads(false);
+        if (!u) { status('请输入分享链接'); return; }
+        try {
+          const resp = await fetch('/api/extract', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: u })
+          });
+          const data = await resp.json();
+          if (!resp.ok || !data.ok) throw new Error(data.error || ('HTTP '+resp.status));
+          lastData = data.messages || [];
+          render(lastData);
+          status('完成'); stats.textContent = `共 ${lastData.length} 条 · ${new Date().toLocaleString()}`;
+          toggleDownloads(true);
+        } catch (e) {
+          console.error(e); status(e.message || String(e), true);
+        }
+      });
+
+      function render(messages){
+        results.innerHTML = '';
+        if (!messages.length) { results.innerHTML = '<div class="small">未提取到消息。</div>'; return; }
+        messages.forEach((m,i) => {
+          const div = document.createElement('div');
+          div.className = 'msg';
+          const meta = document.createElement('div');
+          meta.className = 'meta';
+          const role = document.createElement('span');
+          role.className = 'role ' + (m.role === 'assistant' ? 'assistant' : 'user');
+          role.textContent = m.role.toUpperCase();
+          const idx = document.createElement('span'); idx.textContent = '#' + (i+1);
+          meta.appendChild(role); meta.appendChild(idx);
+          const txt = document.createElement('div');
+          txt.className = 'txt'; txt.textContent = m.text;
+          div.appendChild(meta); div.appendChild(txt);
+          results.appendChild(div);
+        });
+      }
+
+      function toggleDownloads(enabled){
+        saveTxt.disabled = !enabled; saveJson.disabled = !enabled;
+        if (!enabled) { saveTxt.onclick = null; saveJson.onclick = null; return; }
+        const txt = toTxt(lastData);
+        const json = JSON.stringify(lastData.map((m, i) => ({idx: i+1, role: m.role, text: m.text})), null, 2);
+        saveTxt.onclick = () => download('chat_messages.txt', txt, 'text/plain');
+        saveJson.onclick = () => download('chat_messages.json', json, 'application/json');
+      }
+
+      function toTxt(arr){
+        const parts = [];
+        arr.forEach((m,i) => { parts.push(`--- ${i+1}. ${m.role.toUpperCase()} ---`); parts.push(m.text); parts.push(''); });
+        return parts.join('\\n');
+      }
+
+      function download(name, content, mime){
+        const blob = new Blob([content], {type:mime});
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+        setTimeout(()=> URL.revokeObjectURL(a.href), 1000);
+      }
+
+      function status(t, err=false){ statusEl.textContent = t || ''; statusEl.classList.toggle('err', !!err); }
+    </script>
+  </body>
+</html>
+"""
+
+ROLE_MARKER = re.compile(r'data-message-author-role="(user|assistant)"', re.I)
+
+def _strip_html(chunk: str) -> str:
+    chunk = re.sub(r"<script[^>]*>.*?</script>", "", chunk, flags=re.DOTALL|re.IGNORECASE)
+    chunk = re.sub(r"<style[^>]*>.*?</style>", "", chunk, flags=re.DOTALL|re.IGNORECASE)
+    chunk = re.sub(r"<[^>]+>", "", chunk)
     try:
-        u = urlparse.urlparse(target)
-        if u.scheme not in ("http", "https"):
-            return False
-        host = (u.hostname or "").lower()
-        if PRIVATE_NET_RE.match(host or ""):
-            return False
-        if not ALLOWED_HOSTS:
-            return True
-        return any(host == h or host.endswith("." + h) for h in ALLOWED_HOSTS)
+        import html as _html
+        chunk = _html.unescape(chunk)
+    except Exception:
+        pass
+    chunk = chunk.replace("\r\n", "\n").replace("\r", "\n")
+    chunk = re.sub(r"[ \t]+", " ", chunk)
+    chunk = re.sub(r"\n{3,}", "\n\n", chunk)
+    return chunk.strip()
+
+def _post_clean(text: str) -> str:
+    text = re.sub(r"ChatGPT\s*说：.*", "", text, flags=re.I)
+    text = re.sub(r"(?m)^\s*复制链接.*$", "", text)
+    text = re.sub(r"(?mi)^\s*Open in ChatGPT.*$", "", text)
+    text = re.sub(r"(?mi)^\s*Copy link.*$", "", text)
+    text = re.sub(r"(?mi)^\s*Regenerate.*$", "", text)
+    text = re.sub(r"(?mi)^\s*模型:.*$", "", text)
+    text = re.sub(r"(?mi)^\s*Model:.*$", "", text)
+    text = text.strip(" <>")
+    return text.strip()
+
+def extract_messages(raw_html: str) -> List[Tuple[str, str]]:
+    results: List[Tuple[str, str]] = []
+    pos = 0
+    while True:
+        m = ROLE_MARKER.search(raw_html, pos)
+        if not m:
+            break
+        role = m.group(1).lower()
+        tag_close = raw_html.find(">", m.end())
+        if tag_close == -1:
+            tag_close = m.end()
+        start_content = tag_close + 1
+        next_m = ROLE_MARKER.search(raw_html, start_content)
+        end_content = next_m.start() if next_m else len(raw_html)
+        chunk = raw_html[start_content:end_content]
+        text = _strip_html(chunk)
+        text = _post_clean(text)
+        results.append((role, text))
+        pos = end_content
+    return results
+
+PRIVATE_NETS = [
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("127..0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+def _is_ip_private(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+        return any(addr in net for net in PRIVATE_NETS)
+    except Exception:
+        return True
+
+def _host_ok(host: str) -> bool:
+    h = (host or "").lower().strip()
+    if not h: return False
+    if h in {"localhost", "localhost.", "ip6-localhost"}: return False
+    if ALLOWED_HOSTS is not None and h not in ALLOWED_HOSTS:
+        return False
+    try:
+        infos = socket.getaddrinfo(h, None)
+        ips = {ai[4][0] for ai in infos if ai and ai[4]}
+        if not ips: return False
+        return not any(_is_ip_private(ip) for ip in ips)
     except Exception:
         return False
 
-def fetch_html(url: str) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    resp = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
-    resp.raise_for_status()
-    resp.encoding = resp.encoding or resp.apparent_encoding
-    return resp.text or resp.content.decode(resp.encoding or "utf-8", errors="ignore")
-
-# —— 与前端一致的清洗 ——
-KILL_PATTERNS = [
-    re.compile(r"ChatGPT\s*说：.*", re.IGNORECASE),
-    re.compile(r"复制链接.*", re.IGNORECASE),
-    re.compile(r"Copy link.*", re.IGNORECASE),
-    re.compile(r"Open in ChatGPT.*", re.IGNORECASE),
-    re.compile(r"Use GPT-.*", re.IGNORECASE),
-    re.compile(r"Regenerate.*", re.IGNORECASE),
-    re.compile(r"模型:.*$", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"Model:.*$", re.IGNORECASE | re.MULTILINE),
-]
-
-def post_clean(text: str) -> str:
-    if not text:
-        return ""
-    t = text.replace("\r\n", "\n").replace("\r", "\n")
-    for pat in KILL_PATTERNS:
-        t = pat.sub("", t)
-    t = re.sub(r"[ \t]+", " ", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()
-
-def guess_role_bs(el) -> str:
-    role = (el.get("data-message-author-role") or "").strip().lower()
-    if role in ("assistant", "user"):
-        return role
-    klass = " ".join(el.get("class") or []).lower()
-    return "assistant" if "assistant" in klass or "gpt" in klass else "user"
-
-def extract_via_dom(html_text: str) -> List[Dict[str, str]]:
-    soup = BeautifulSoup(html_text, "lxml")
-    nodes = soup.select("[data-message-author-role]")
-    if not nodes:
-        nodes = soup.select("[data-message-id]")
-    if not nodes:
-        nodes = [el for el in soup.find_all(attrs={"data-testid": True})
-                 if "message" in str(el.get("data-testid")).lower()]
-    msgs: List[Dict[str, str]] = []
-    for el in nodes:
-        role = guess_role_bs(el)
-        raw = el.get_text(separator="\n", strip=True)
-        text = post_clean(raw)
-        if not text:
-            continue
-        compact = re.sub(r"[\s\u200b\u200c\u200d]+", " ", text).strip()
-        if not compact:
-            continue
-        if re.match(r"^(复制链接|Copy link|预览|Open in ChatGPT|Use GPT|登录|Log in|Sign in)\b", compact, re.I):
-            continue
-        msgs.append({"role": role, "text": text})
-    cleaned = []
-    for m in msgs:
-        if not cleaned or cleaned[-1]["text"] != m["text"] or cleaned[-1]["role"] != m["role"]:
-            cleaned.append(m)
-    return cleaned
-
-NEXT_DATA_RE = re.compile(
-    r'<script[^>]+id="__NEXT_DATA__"[^>]*>\s*({.*?})\s*</script>',
-    re.DOTALL | re.IGNORECASE,
-)
-PUSH_CHUNK_RE = re.compile(
-    r"self\.__next_f\.push\(\s*(\[[\s\S]*?\])\s*\)\s*;",
-    re.IGNORECASE,
-)
-
-def _coalesce_text_from_content(content):
-    if isinstance(content, dict):
-        if "parts" in content and isinstance(content["parts"], list):
-            return "\n".join([str(x) for x in content["parts"] if x is not None]).strip()
-        if "text" in content and isinstance(content["text"], str):
-            return content["text"].strip()
-    if isinstance(content, list):
-        return "\n".join([str(x) for x in content if x is not None]).strip()
-    if isinstance(content, str):
-        return content.strip()
-    return ""
-
-def _walk_messages(obj):
-    if isinstance(obj, dict):
-        role = None
-        if isinstance(obj.get("author"), dict) and isinstance(obj["author"].get("role"), str):
-            role = obj["author"]["role"]
-        elif isinstance(obj.get("role"), str):
-            role = obj["role"]
-        if role:
-            text = ""
-            for key in ("content", "message", "value"):
-                if key in obj:
-                    text = _coalesce_text_from_content(obj[key])
-                    if text:
-                        break
-            if not text and isinstance(obj.get("text"), str):
-                text = obj["text"].strip()
-            if text:
-                yield {"role": "assistant" if role == "assistant" else "user", "text": text}
-        for v in obj.values():
-            yield from _walk_messages(v)
-    elif isinstance(obj, list):
-        for it in obj:
-            yield from _walk_messages(it)
-
-def extract_via_nextdata(html_text: str):
-    all_msgs = []
-    m = NEXT_DATA_RE.search(html_text)
-    if m:
+def _safe_fetch(url: str) -> str:
+    parsed = urlparse.urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("仅允许 http/https 链接")
+    if not _host_ok(parsed.hostname or ""):
+        raise ValueError("目标主机不被允许（可能为内网/本地地址或不在白名单）")
+    headers = {"User-Agent": USER_AGENT}
+    with requests.get(url, headers=headers, timeout=TIMEOUT, stream=True, allow_redirects=True) as r:
+        r.raise_for_status()
+        total = 0
+        chunks = []
+        for chunk in r.iter_content(8192):
+            if chunk:
+                chunks.append(chunk); total += len(chunk)
+                if total > MAX_BYTES:
+                    raise ValueError(f"响应体超过大小限制 {MAX_BYTES} 字节")
+        data = b"".join(chunks)
+        enc = r.encoding or "utf-8"
         try:
-            data = json.loads(m.group(1))
-            all_msgs.extend(list(_walk_messages(data)))
+            text = data.decode(enc, errors="replace")
         except Exception:
-            pass
-    for mm in PUSH_CHUNK_RE.finditer(html_text):
-        payload = mm.group(1)
-        try:
-            data = json.loads(payload)
-            all_msgs.extend(list(_walk_messages(data)))
-        except Exception:
-            continue
-    soup = BeautifulSoup(html_text, "lxml")
-    for s in soup.find_all("script", {"type": "application/json"}):
-        txt = (s.string or s.get_text() or "").strip()
-        if '"author"' in txt and '"role"' in txt:
-            try:
-                data = json.loads(txt)
-                all_msgs.extend(list(_walk_messages(data)))
-            except Exception:
-                continue
-    uniq, seen = [], set()
-    for m in all_msgs:
-        key = (m["role"], m["text"])
-        if key not in seen:
-            t = post_clean(_html.unescape(m["text"]))
-            if t:
-                uniq.append({"role": m["role"], "text": t})
-                seen.add(key)
-    return uniq
+            text = data.decode("utf-8", errors="replace")
+        return text
 
-def extract_messages(html_text: str):
-    dom_msgs = extract_via_dom(html_text)
-    if dom_msgs:
-        return dom_msgs
-    json_msgs = extract_via_nextdata(html_text)
-    return json_msgs
+from flask import Response
 
-@app.get("/")
-def home():
-    return render_template("index.html", app_name=APP_NAME, allowed_hosts=", ".join(sorted(ALLOWED_HOSTS)))
+APP = Flask(__name__)
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "app": APP_NAME}
+@APP.after_request
+def add_cors(resp: Response):
+    resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+    resp.headers["Vary"] = "Origin"
+    resp.headers["Access-Control-Allow-Headers"] = request.headers.get("Access-Control-Request-Headers", "Content-Type, Authorization")
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    resp.headers["Access-Control-Max-Age"] = "86400"
+    return resp
 
-@app.post("/api/extract")
+@APP.route("/", methods=["GET"])
+def index():
+    return Response(INDEX_HTML, mimetype="text/html; charset=utf-8")
+
+@APP.route("/api/extract", methods=["POST", "OPTIONS"])
 def api_extract():
+    if request.method == "OPTIONS":
+        return ("", 204)
     if ACCESS_TOKEN:
-        token = request.headers.get("X-Proxy-Token", "")
+        token = request.headers.get("X-Access-Token", "")
         if token != ACCESS_TOKEN:
-            return jsonify({"error": "unauthorized"}), 401
-
-    if "html_file" in request.files and request.files["html_file"]:
-        f = request.files["html_file"]
-        blob = f.read()
-        content = None
-        for enc in ("utf-8", "latin-1"):
-            try:
-                content = blob.decode(enc, errors="ignore")
-                break
-            except Exception:
-                continue
-        if content is None:
-            content = blob.decode("utf-8", errors="ignore")
-        msgs = extract_messages(content)
-        return jsonify({"count": len(msgs), "messages": msgs})
-
-    data = request.get_json(silent=True) or {}
-    url = (data.get("url") or request.args.get("url") or "").strip()
-    if not url:
-        return jsonify({"error": "missing 'url' or 'html_file'"}), 400
-    if not is_allowed_url(url):
-        return jsonify({"error": "url not allowed for server-side fetch"}), 400
-
+            return jsonify(ok=False, error="Unauthorized"), 401
     try:
-        html_text = fetch_html(url)
+        data = request.get_json(silent=True) or {}
+        u = (data.get("url") or "").strip()
+        if not u: return jsonify(ok=False, error="缺少 url"), 400
+        raw_html = _safe_fetch(u)
+        pairs = extract_messages(raw_html)
+        messages = [{"idx": i+1, "role": r, "text": t} for i, (r, t) in enumerate(pairs)]
+        return jsonify(ok=True, count=len(messages), messages=messages)
     except requests.HTTPError as e:
-        return jsonify({"error": f"http error: {e.response.status_code}"}), 502
-    except requests.RequestException as e:
-        return jsonify({"error": f"request failed: {e.__class__.__name__}: {e}"}), 502
+        return jsonify(ok=False, error=f"上游 HTTP 错误：{e.response.status_code}"), 502
     except Exception as e:
-        return jsonify({"error": f"unexpected error: {e}"}), 500
+        return jsonify(ok=False, error=str(e)), 400
 
-    msgs = extract_messages(html_text)
-    return jsonify({"count": len(msgs), "messages": msgs})
+@APP.route("/healthz", methods=["GET"])
+def healthz():
+    return jsonify(ok=True)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    port = int(os.environ.get("PORT", "5000"))
+    APP.run(host="0.0.0.0", port=port, debug=False)
+"""
