@@ -1,109 +1,162 @@
-# app.py — FastAPI 版跨域代理（含白名单/令牌/Referer/UA）
+# app.py
 import os
-from urllib.parse import urlparse
-from typing import Optional
-import httpx
-from fastapi import FastAPI, Request, Response, HTTPException
-from fastapi.responses import PlainTextResponse
-from starlette.middleware.cors import CORSMiddleware
+import re
+import urllib.parse as urlparse
+from flask import Flask, request, jsonify, render_template, abort
+import requests
+from bs4 import BeautifulSoup
 
-ALLOWED_HOSTS = {h.strip() for h in os.getenv("ALLOWED_HOSTS", "").split(",") if h.strip()}
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")  # 可选：需要时前端 header: X-Proxy-Token
-TIMEOUT = float(os.getenv("TIMEOUT", "15"))
-DEFAULT_REFERER = os.getenv("DEFAULT_REFERER", "")  # 可选：为部分站点补 Referer
+APP_NAME = "chatgpt-share-extractor"
+DEFAULT_ALLOWED = {"chatgpt.com", "chat.openai.com", "shareg.pt"}
 
-app = FastAPI(title="CORS Proxy")
-# CORS：放行所有来源（前端更易用）。如需更严谨可改为你的站点域名。
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    max_age=86400,
+app = Flask(__name__, template_folder="templates", static_folder="static")
+
+# Optional simple access token to avoid public abuse
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "").strip()
+
+# Allowed hosts for server-side fetching
+_env_hosts = os.environ.get("ALLOWED_HOSTS", "")
+if _env_hosts.strip():
+    ALLOWED_HOSTS = {h.strip().lower() for h in _env_hosts.split(",") if h.strip()}
+else:
+    ALLOWED_HOSTS = DEFAULT_ALLOWED
+
+# Safety: block localhost/metadata/169.254.* SSRF
+PRIVATE_NET_RE = re.compile(
+    r"^(localhost|127\.0\.0\.1|0\.0\.0\.0|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+)$",
+    re.IGNORECASE,
 )
 
-HOP_BY_HOP = {
-    "connection","keep-alive","proxy-authenticate","proxy-authorization",
-    "te","trailer","transfer-encoding","upgrade",
-}
+def is_allowed_url(target: str) -> bool:
+    try:
+        u = urlparse.urlparse(target)
+        if u.scheme not in ("http", "https"):
+            return False
+        host = (u.hostname or "").lower()
+        if PRIVATE_NET_RE.match(host or ""):
+            return False
+        if not ALLOWED_HOSTS:
+            return True
+        # allow subdomains of allowed hosts too
+        return any(host == h or host.endswith("." + h) for h in ALLOWED_HOSTS)
+    except Exception:
+        return False
 
-BROWSER_HEADERS = {
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36",
-    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "sec-fetch-site": "none",
-    "sec-fetch-mode": "navigate",
-    "sec-fetch-dest": "document",
-}
+def fetch_html(url: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    resp = requests.get(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+    # try to respect server encoding if provided
+    resp.encoding = resp.apparent_encoding or resp.encoding
+    return resp.text
 
-def check_allowed(host: str):
-    if not ALLOWED_HOSTS:
-        return True
-    return host in ALLOWED_HOSTS
+KILL_PATTERNS = [
+    re.compile(r"ChatGPT\s*说：.*", re.IGNORECASE),
+    re.compile(r"复制链接.*", re.IGNORECASE),
+    re.compile(r"Copy link.*", re.IGNORECASE),
+    re.compile(r"Open in ChatGPT.*", re.IGNORECASE),
+    re.compile(r"Use GPT-.*", re.IGNORECASE),
+    re.compile(r"Regenerate.*", re.IGNORECASE),
+    re.compile(r"模型:.*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"Model:.*$", re.IGNORECASE | re.MULTILINE),
+]
+
+def post_clean(text: str) -> str:
+    if not text:
+        return ""
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    for pat in KILL_PATTERNS:
+        t = pat.sub("", t)
+    # collapse spaces and empty lines
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+def guess_role(el) -> str:
+    role = (el.get("data-message-author-role") or "").strip().lower()
+    if role:
+        return "assistant" if role == "assistant" else "user"
+    # fallback guess via class names
+    klass = " ".join(el.get("class") or []).lower()
+    if "assistant" in klass or "gpt" in klass:
+        return "assistant"
+    return "user"
+
+def extract_messages_from_html(html: str):
+    soup = BeautifulSoup(html, "lxml")
+    # primary selection
+    nodes = soup.select("[data-message-author-role]")
+    # fallback: elements that look like messages
+    if not nodes:
+        nodes = soup.select("[data-message-id]")
+    if not nodes:
+        # data-testid contains 'message' (case-insensitive) – approximate
+        nodes = [el for el in soup.find_all(attrs={"data-testid": True}) if "message" in str(el.get("data-testid")).lower()]
+    msgs = []
+    for el in nodes:
+        role = guess_role(el)
+        raw = el.get_text(separator="\n", strip=True)
+        text = post_clean(raw)
+        if not text:
+            continue
+        # filter out tiny UI garbage
+        compact = re.sub(r"[\s\u200b\u200c\u200d]+", " ", text).strip()
+        if not compact:
+            continue
+        if re.match(r"^(复制链接|Copy link|预览|Open in ChatGPT|Use GPT|登录|Log in|Sign in)\\b", compact, re.I):
+            continue
+        msgs.append({"role": role, "text": text})
+    return msgs
 
 @app.get("/")
-def root():
-    return PlainTextResponse("OK. Use /proxy?url=https://example.com")
+def home():
+    return render_template("index.html", app_name=APP_NAME, allowed_hosts=", ".join(sorted(ALLOWED_HOSTS)))
 
-@app.api_route("/proxy", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])
-async def proxy(request: Request, url: Optional[str] = None, debug: Optional[int] = 0):
+@app.get("/health")
+def health():
+    return {"status": "ok", "app": APP_NAME}
+
+@app.post("/api/extract")
+def api_extract():
+    # Optional simple token
     if ACCESS_TOKEN:
-        token = request.headers.get("X-Proxy-Token") or ""
+        token = request.headers.get("X-Proxy-Token", "")
         if token != ACCESS_TOKEN:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+            return jsonify({"error": "unauthorized"}), 401
 
+    # File upload takes priority
+    if "html_file" in request.files and request.files["html_file"]:
+        f = request.files["html_file"]
+        try:
+            content = f.read().decode("utf-8", errors="ignore")
+        except Exception:
+            content = f.read().decode("latin-1", errors="ignore")
+        msgs = extract_messages_from_html(content)
+        return jsonify({"count": len(msgs), "messages": msgs})
+
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or request.args.get("url") or "").strip()
     if not url:
-        raise HTTPException(status_code=400, detail="Missing ?url=")
+        return jsonify({"error": "missing 'url' or 'html_file'"}), 400
+
+    if not is_allowed_url(url):
+        return jsonify({"error": "url not allowed for server-side fetch"}), 400
 
     try:
-        p = urlparse(url)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Bad url")
-    if p.scheme not in ("http", "https"):
-        raise HTTPException(status_code=400, detail="Protocol not allowed")
-    if not check_allowed(p.hostname or ""):
-        raise HTTPException(status_code=403, detail=f"Host not allowed: {p.hostname}")
+        html = fetch_html(url)
+    except requests.HTTPError as e:
+        return jsonify({"error": f"http error: {e.response.status_code}"}), 502
+    except requests.RequestException as e:
+        return jsonify({"error": f"request failed: {e.__class__.__name__}: {e}"}), 502
+    except Exception as e:
+        return jsonify({"error": f"unexpected error: {e}"}), 500
 
-    # 复制请求头（去掉 hop-by-hop）
-    fwd_headers = {}
-    for k, v in request.headers.items():
-        lk = k.lower()
-        if lk in HOP_BY_HOP:
-            continue
-        # 默认不转发 Cookie，减少风控；如需登录可放开：
-        if lk == "cookie":
-            continue
-        fwd_headers[k] = v
+    msgs = extract_messages_from_html(html)
+    return jsonify({"count": len(msgs), "messages": msgs})
 
-    for k, v in BROWSER_HEADERS.items():
-        fwd_headers.setdefault(k, v)
-
-    # 可选 Referer
-    if DEFAULT_REFERER and "referer" not in {k.lower() for k in fwd_headers}:
-        fwd_headers["Referer"] = DEFAULT_REFERER
-
-    method = request.method.upper()
-    content = await request.body() if method not in ("GET", "HEAD") else None
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=TIMEOUT) as client:
-        try:
-            upstream = await client.request(method, url, headers=fwd_headers, content=content)
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {e}")
-
-    # 过滤某些不适合直出的响应头
-    out_headers = {}
-    for k, v in upstream.headers.items():
-        lk = k.lower()
-        if lk in HOP_BY_HOP or lk == "set-cookie":
-            continue
-        out_headers[k] = v
-
-    if debug:
-        out_headers["x-upstream-status"] = str(upstream.status_code)
-        out_headers["x-upstream-url"] = url
-
-    return Response(content=upstream.content, status_code=upstream.status_code, headers=out_headers)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
