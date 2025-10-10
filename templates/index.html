@@ -1,0 +1,241 @@
+<!-- templates/index.html -->
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ app_name }} · 服务器代抓取解析</title>
+  <style>
+    :root {
+      --bg: #0b0d10;
+      --panel: #12161b;
+      --ink: #e6e9ef;
+      --muted: #9aa3af;
+      --acc: #6ee7b7;
+      --err: #ff6b6b;
+      --border: #1f2937;
+    }
+    html, body { height: 100%; }
+    body {
+      margin: 0; background: var(--bg); color: var(--ink);
+      font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+    }
+    .wrap { max-width: 980px; margin: 32px auto; padding: 0 16px; }
+    .card {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 16px; box-shadow: 0 6px 24px rgba(0,0,0,.25);
+      padding: 20px;
+    }
+    h1 { font-size: 22px; margin: 0 0 12px; letter-spacing: .2px; }
+    .sub { color: var(--muted); margin: 0 0 18px; }
+    label { display: block; color: var(--muted); margin-bottom: 6px; }
+    input[type="text"], input[type="url"], input[type="search"], input[type="file"], textarea {
+      width: 100%; box-sizing: border-box;
+      background: #0d1116; color: var(--ink);
+      border: 1px solid var(--border); border-radius: 10px;
+      padding: 12px 14px; outline: none;
+    }
+    .row { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    @media (min-width: 720px){ .row-2 { grid-template-columns: 1.6fr .4fr; } }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+    .bar { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    button {
+      appearance: none; border: 1px solid var(--border); color: var(--ink);
+      background: #0f141b; padding: 10px 14px; border-radius: 10px;
+      cursor: pointer; transition: transform .03s ease-in-out, border-color .2s;
+    }
+    button:hover { border-color: #334155; }
+    button:active { transform: translateY(1px); }
+    button.primary { background: linear-gradient(180deg, #1f2937, #0f172a); border-color: #223047; }
+    button.accent { background: linear-gradient(180deg, #064e3b, #052e2f); border-color: #065f46; color: #d1fae5; }
+    button[disabled] { opacity: .5; cursor: not-allowed; }
+    .switch { display:flex; align-items:center; gap:10px; margin-top:4px; }
+    .switch input[type="checkbox"]{ transform: scale(1.1); }
+
+    .status { margin-top: 14px; min-height: 22px; color: var(--muted); }
+    .status.err { color: var(--err); }
+
+    .results { margin-top: 18px; display: grid; gap: 12px; }
+    .msg { border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; background: #0b1015; }
+    .meta { display:flex; gap:8px; align-items:center; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    .role { padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+    .role.user { background: rgba(59,130,246,.15); color:#bfdbfe; border:1px solid #1d4ed8; }
+    .role.assistant { background: rgba(16,185,129,.15); color:#bbf7d0; border:1px solid #065f46; }
+    .txt { white-space: pre-wrap; }
+    .toolbar { display:flex; gap:8px; align-items:center; justify-content:flex-end; margin-top: 8px; }
+    .small { font-size: 12px; color: var(--muted); }
+    footer { margin: 24px 0; color: var(--muted); font-size: 12px; }
+    code.inline { background: #0c1218; border:1px solid var(--border); padding:2px 6px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>ChatGPT 分享页对话提取器（服务器代抓取版）</h1>
+      <p class="sub">输入 ChatGPT 分享链接，或上传分享页的 HTML 文件，服务器将代为抓取并解析，无跨域问题。默认允许域名：<code class="inline">{{ allowed_hosts }}</code></p>
+
+      <div class="row row-2">
+        <div>
+          <label for="urlInput">分享链接（URL）</label>
+          <input id="urlInput" type="url" placeholder="https://chatgpt.com/share/..." />
+          <div class="hint">服务器会以 <code class="inline">requests</code> 代为请求并返回消息 JSON。</div>
+        </div>
+        <div>
+          <label for="fileInput">或上传分享页 HTML</label>
+          <input id="fileInput" type="file" accept="text/html,.html,.htm" />
+          <div class="hint">本地保存的 HTML 上传到服务器解析。</div>
+        </div>
+      </div>
+
+      <div class="bar">
+        <button id="extractBtn" class="primary">提取对话</button>
+        <button id="clearBtn">清空</button>
+        <span class="status" id="status"></span>
+      </div>
+
+      <div class="toolbar">
+        <button id="downloadTxt" class="accent" disabled>下载 .txt</button>
+        <button id="downloadJson" class="accent" disabled>下载 .json</button>
+        <span class="small" id="stats"></span>
+      </div>
+
+      <div id="results" class="results"></div>
+
+      <footer class="small">
+        <p>可选地设置服务端环境变量：<code class="inline">ALLOWED_HOSTS</code>（允许代抓取的域，逗号分隔），<code class="inline">ACCESS_TOKEN</code>（若设置则前端需在请求头携带 <code class="inline">X-Proxy-Token</code>）。</p>
+      </footer>
+    </div>
+  </div>
+
+  <script>
+    const $ = (sel) => document.querySelector(sel);
+    const urlInput = $('#urlInput');
+    const fileInput = $('#fileInput');
+    const extractBtn = $('#extractBtn');
+    const clearBtn = $('#clearBtn');
+    const resultsEl = $('#results');
+    const statusEl = $('#status');
+    const statsEl = $('#stats');
+    const btnTxt = $('#downloadTxt');
+    const btnJson = $('#downloadJson');
+
+    clearBtn.addEventListener('click', () => {
+      urlInput.value = '';
+      fileInput.value = '';
+      resultsEl.innerHTML = '';
+      status('');
+      stats('');
+      toggleDownloads(false);
+    });
+
+    extractBtn.addEventListener('click', async () => {
+      resultsEl.innerHTML = '';
+      status('处理中…');
+      stats('');
+      toggleDownloads(false);
+
+      try {
+        let resp;
+        const file = fileInput.files && fileInput.files[0];
+        if (file) {
+          const fd = new FormData();
+          fd.append('html_file', file, file.name);
+          resp = await fetch('/api/extract', { method:'POST', body: fd });
+        } else {
+          const url = (urlInput.value || '').trim();
+          if (!url) throw new Error('请输入分享链接或上传 HTML 文件');
+          resp = await fetch('/api/extract', {
+            method: 'POST',
+            headers: { 'Content-Type':'application/json' },
+            body: JSON.stringify({ url })
+          });
+        }
+
+        if (!resp.ok) {
+          const err = await safeJson(resp);
+          throw new Error(err.error || ('HTTP ' + resp.status));
+        }
+        const data = await resp.json();
+        render(data.messages || []);
+        status(`完成。共提取 ${data.count||0} 条消息。`);
+        stats(`${new Date().toLocaleString()} · 提取 ${data.count||0} 条`);
+        toggleDownloads((data.count||0) > 0, data.messages || []);
+      } catch (err) {
+        console.error(err);
+        status(err.message || String(err), true);
+      }
+    });
+
+    function status(t, isErr=false){
+      statusEl.textContent = t || '';
+      statusEl.classList.toggle('err', !!isErr);
+    }
+    function stats(t){ statsEl.textContent = t || ''; }
+
+    function toggleDownloads(enabled, data){
+      btnTxt.disabled = !enabled;
+      btnJson.disabled = !enabled;
+      if(!enabled){
+        btnTxt.onclick = null;
+        btnJson.onclick = null;
+        return;
+      }
+      const txt = toTxt(data);
+      const json = JSON.stringify(data.map((m,i)=>({idx:i+1, role:m.role, text:m.text})), null, 2);
+      btnTxt.onclick = () => download('chat_messages.txt', txt, 'text/plain');
+      btnJson.onclick = () => download('chat_messages.json', json, 'application/json');
+    }
+
+    async function safeJson(resp){
+      try { return await resp.json(); }
+      catch { return { error: '请求失败' }; }
+    }
+
+    function render(messages){
+      resultsEl.innerHTML = '';
+      if (!messages.length){
+        resultsEl.innerHTML = '<div class="small">未提取到消息。</div>';
+        return;
+      }
+      messages.forEach((m, i) => {
+        const box = document.createElement('div');
+        box.className = 'msg';
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        const role = document.createElement('span');
+        role.className = 'role ' + (m.role === 'assistant' ? 'assistant' : 'user');
+        role.textContent = m.role.toUpperCase();
+        const idx = document.createElement('span'); idx.textContent = `#${i+1}`;
+        meta.appendChild(role); meta.appendChild(idx);
+
+        const txt = document.createElement('div');
+        txt.className = 'txt';
+        txt.textContent = m.text; // 保留换行
+
+        box.appendChild(meta);
+        box.appendChild(txt);
+        resultsEl.appendChild(box);
+      });
+    }
+
+    function toTxt(messages){
+      const parts = [];
+      messages.forEach((m, i) => {
+        parts.push(`--- ${i+1}. ${m.role.toUpperCase()} ---`);
+        parts.push(m.text);
+        parts.push('');
+      });
+      return parts.join('\n');
+    }
+
+    function download(filename, content, mime){
+      const blob = new Blob([content], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename; a.style.display = 'none';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=> URL.revokeObjectURL(url), 1000);
+    }
+  </script>
+</body>
+</html>
