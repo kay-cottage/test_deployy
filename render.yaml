@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: chatgpt-share-extractor
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: ALLOWED_HOSTS
+        value: chatgpt.com,chat.openai.com,share.gpt
+      - key: ACCESS_TOKEN
+        generateValue: true
