@@ -1,4 +1,4 @@
-# app.py  — chatgpt-share-extractor (DOM优先 + __NEXT_DATA__ 回退)
+# app.py — chatgpt-share-extractor (DOM优先 + __NEXT_DATA__/streaming 回退 + JSON heuristics)
 import os, re, json, html, urllib.parse as urlparse
 from typing import List, Dict, Any, Iterable
 import requests
@@ -39,7 +39,6 @@ def is_allowed_url(target: str) -> bool:
 
 def fetch_html(url: str) -> str:
     headers = {
-        # 模拟常见浏览器；部分站点会按 UA/语言回传不同模板
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/120.0.0.0 Safari/537.36",
@@ -48,11 +47,10 @@ def fetch_html(url: str) -> str:
     }
     resp = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
     resp.raise_for_status()
-    # 尽量用服务器声明编码；否则退回 apparent_encoding
     resp.encoding = resp.encoding or resp.apparent_encoding
     return resp.text or resp.content.decode(resp.encoding or "utf-8", errors="ignore")
 
-# —— 与前端 index.html 同步的清洗规则（postClean）——
+# —— 与前端 index.html 同步的清洗规则 ——
 KILL_PATTERNS = [
     re.compile(r"ChatGPT\s*说：.*", re.IGNORECASE),
     re.compile(r"复制链接.*", re.IGNORECASE),
@@ -82,130 +80,135 @@ def guess_role_bs(el) -> str:
     return "assistant" if "assistant" in klass or "gpt" in klass else "user"
 
 def extract_via_dom(html_text: str) -> List[Dict[str, str]]:
-    """与前端 index.html 的 DOM 选择器一致：优先 [data-message-author-role]，
-       回退 [data-message-id] / [data-testid*='message' i]。"""
     soup = BeautifulSoup(html_text, "lxml")
-    nodes = soup.select("[data-message-author-role]")  # 首选
+    nodes = soup.select("[data-message-author-role]")
     if not nodes:
-        nodes = soup.select("[data-message-id]")  # 回退1
+        nodes = soup.select("[data-message-id]")
     if not nodes:
-        # data-testid 包含 “message”（不区分大小写）
         nodes = [el for el in soup.find_all(attrs={"data-testid": True})
                  if "message" in str(el.get("data-testid")).lower()]
-
     msgs: List[Dict[str, str]] = []
     for el in nodes:
         role = guess_role_bs(el)
-        raw = el.get_text(separator="\n", strip=True)
+        raw = el.get_text(separator="\\n", strip=True)
         text = post_clean(raw)
         if not text:
             continue
-        compact = re.sub(r"[\s\u200b\u200c\u200d]+", " ", text).strip()
+        compact = re.sub(r"[\\s\\u200b\\u200c\\u200d]+", " ", text).strip()
         if not compact:
             continue
-        if re.match(r"^(复制链接|Copy link|预览|Open in ChatGPT|Use GPT|登录|Log in|Sign in)\b", compact, re.I):
+        if re.match(r"^(复制链接|Copy link|预览|Open in ChatGPT|Use GPT|登录|Log in|Sign in)\\b", compact, re.I):
             continue
         msgs.append({"role": role, "text": text})
-    return msgs
+    # 去相邻重复
+    cleaned = []
+    for m in msgs:
+        if not cleaned or cleaned[-1]["text"] != m["text"] or cleaned[-1]["role"] != m["role"]:
+            cleaned.append(m)
+    return cleaned
 
-# —— 回退：解析 Next.js 注水的 __NEXT_DATA__ / streaming payload —— 
+# —— 回退：解析 Next.js 注水 / streaming —— 
 NEXT_DATA_RE = re.compile(
-    r'<script[^>]+id="__NEXT_DATA__"[^>]*>\s*({.*?})\s*</script>',
+    r'<script[^>]+id="__NEXT_DATA__"[^>]*>\\s*({.*?})\\s*</script>',
     re.DOTALL | re.IGNORECASE,
 )
 PUSH_CHUNK_RE = re.compile(
-    r"self\.__next_f\.push\(\s*(\[[\s\S]*?\])\s*\)\s*;",
+    r"self\\.__next_f\\.push\\(\\s*(\\[[\\s\\S]*?\\])\\s*\\)\\s*;",
     re.IGNORECASE,
 )
 
-def _iter_json_like_strings(html_text: str) -> Iterable[str]:
-    # 1) 传统 __NEXT_DATA__
-    m = NEXT_DATA_RE.search(html_text)
-    if m:
-        yield m.group(1)
-    # 2) Next.js streaming flight（多段 push）
-    for mm in PUSH_CHUNK_RE.finditer(html_text):
-        yield mm.group(1)
-
 def _coalesce_text_from_content(content: Any) -> str:
-    # 常见形态：{'content_type':'text','parts':['...','...']}
     if isinstance(content, dict):
         if "parts" in content and isinstance(content["parts"], list):
-            return "\n".join([str(x) for x in content["parts"] if x is not None]).strip()
+            return "\\n".join([str(x) for x in content["parts"] if x is not None]).strip()
         if "text" in content and isinstance(content["text"], str):
             return content["text"].strip()
     if isinstance(content, list):
-        return "\n".join([str(x) for x in content if x is not None]).strip()
+        return "\\n".join([str(x) for x in content if x is not None]).strip()
     if isinstance(content, str):
         return content.strip()
     return ""
 
 def _walk_messages(obj: Any) -> Iterable[Dict[str, str]]:
-    """在任意深度里找出带 author/role 与 content 的对象"""
     if isinstance(obj, dict):
-        # OpenAI 对话常见：author.role / content(parts or text)
         role = None
         if "author" in obj and isinstance(obj["author"], dict):
             role = obj["author"].get("role")
         elif "role" in obj and isinstance(obj["role"], str):
             role = obj["role"]
-
         if role:
             text = ""
-            # 多种命名：message / content / value / text
-            if "content" in obj:
-                text = _coalesce_text_from_content(obj["content"])
-            elif "message" in obj:
-                text = _coalesce_text_from_content(obj["message"])
-            elif "value" in obj:
-                text = _coalesce_text_from_content(obj["value"])
-            elif "text" in obj and isinstance(obj["text"], str):
+            for key in ("content", "message", "value"):
+                if key in obj:
+                    text = _coalesce_text_from_content(obj[key])
+                    if text:
+                        break
+            if not text and isinstance(obj.get("text"), str):
                 text = obj["text"].strip()
-
             if text:
                 yield {"role": "assistant" if role == "assistant" else "user", "text": text}
-
         for v in obj.values():
             yield from _walk_messages(v)
-
     elif isinstance(obj, list):
         for it in obj:
             yield from _walk_messages(it)
 
 def extract_via_nextdata(html_text: str) -> List[Dict[str, str]]:
     all_msgs: List[Dict[str, str]] = []
-    for payload in _iter_json_like_strings(html_text):
+    # 传统 __NEXT_DATA__
+    m = NEXT_DATA_RE.search(html_text)
+    if m:
+        try:
+            data = json.loads(m.group(1))
+            all_msgs.extend(list(_walk_messages(data)))
+        except Exception:
+            pass
+    # Streaming chunks
+    for mm in PUSH_CHUNK_RE.finditer(html_text):
+        payload = mm.group(1)
         try:
             data = json.loads(payload)
-        except json.JSONDecodeError:
-            # streaming chunk 里可能还有前缀/后缀噪声，做一次宽松修剪
+            all_msgs.extend(list(_walk_messages(data)))
+        except Exception:
+            continue
+    # 兜底：<script type="application/json"> 里寻找 author/role
+    soup = BeautifulSoup(html_text, "lxml")
+    for s in soup.find_all("script", {"type": "application/json"}):
+        txt = (s.string or s.get_text() or "").strip()
+        if '"author"' in txt and '"role"' in txt:
             try:
-                payload2 = payload.strip()
-                data = json.loads(payload2)
+                data = json.loads(txt)
+                all_msgs.extend(list(_walk_messages(data)))
             except Exception:
                 continue
-        for m in _walk_messages(data):
-            txt = post_clean(html.unescape(m["text"]))
-            if txt:
-                all_msgs.append({"role": m["role"], "text": txt})
-    # 去重（保留顺序）
-    uniq = []
-    seen = set()
+    # 去重 + 清洗
+    uniq, seen = [], set()
     for m in all_msgs:
         key = (m["role"], m["text"])
         if key not in seen:
-            uniq.append(m); seen.add(key)
+            t = post_clean(html.unescape(m["text"]))
+            if t:
+                uniq.append({"role": m["role"], "text": t})
+                seen.add(key)
     return uniq
+
+def extract_messages(html_text: str) -> List[Dict[str, str]]:
+    dom_msgs = extract_via_dom(html_text)
+    if dom_msgs:
+        return dom_msgs
+    json_msgs = extract_via_nextdata(html_text)
+    return json_msgs
 
 @app.get("/")
 def home():
+    # 你的 index.html 会放在 templates/ 下；此处仅渲染页头信息
     return render_template("index.html", app_name=APP_NAME, allowed_hosts=", ".join(sorted(ALLOWED_HOSTS)))
 
 @app.get("/health")
 def health():
     return {"status": "ok", "app": APP_NAME}
 
-# （可选）调试/前端用：作为简单跨域代理（仅返回 HTML 文本）
+# （可选）调试：简易代理，返回 HTML（供前端“使用代理拉取”测试）
 @app.get("/api/proxy")
 def proxy():
     url = (request.args.get("url") or "").strip()
@@ -213,10 +216,7 @@ def proxy():
         return "bad url", 400
     try:
         html_text = fetch_html(url)
-        return html_text, 200, {
-            "Content-Type": "text/html; charset=utf-8",
-            "Access-Control-Allow-Origin": "*",
-        }
+        return html_text, 200, {"Content-Type": "text/html; charset=utf-8", "Access-Control-Allow-Origin": "*"}
     except requests.HTTPError as e:
         return f"http error: {e.response.status_code}", 502
     except requests.RequestException as e:
@@ -229,27 +229,22 @@ def api_extract():
         if token != ACCESS_TOKEN:
             return jsonify({"error": "unauthorized"}), 401
 
-    # 上传 HTML 优先
+    # 上传 HTML 文件优先
     if "html_file" in request.files and request.files["html_file"]:
         f = request.files["html_file"]
         blob = f.read()
+        content = None
         for enc in ("utf-8", "latin-1"):
             try:
                 content = blob.decode(enc, errors="ignore")
                 break
             except Exception:
                 continue
-        else:
+        if content is None:
             content = blob.decode("utf-8", errors="ignore")
-        dom_msgs = extract_via_dom(content)
-        if not dom_msgs:
-            json_msgs = extract_via_nextdata(content)
-        else:
-            json_msgs = []
-        msgs = dom_msgs or json_msgs or []
+        msgs = extract_messages(content)
         return jsonify({"count": len(msgs), "messages": msgs})
 
-    # URL 拉取
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or request.args.get("url") or "").strip()
     if not url:
@@ -266,14 +261,7 @@ def api_extract():
     except Exception as e:
         return jsonify({"error": f"unexpected error: {e}"}), 500
 
-    # 先 DOM 再 JSON 回退
-    dom_msgs = extract_via_dom(html_text)
-    if not dom_msgs:
-        json_msgs = extract_via_nextdata(html_text)
-    else:
-        json_msgs = []
-    msgs = dom_msgs or json_msgs or []
-
+    msgs = extract_messages(html_text)
     return jsonify({"count": len(msgs), "messages": msgs})
 
 if __name__ == "__main__":
