@@ -1,9 +1,16 @@
+# Web & Server
 Flask[async]==3.0.3
 gunicorn==23.0.0
 requests==2.32.3
+
+# HTML 解析
 beautifulsoup4==4.12.3
 lxml==5.2.2
+
+# Playwright Python SDK（浏览器镜像/或运行时自动安装 chromium）
 playwright>=1.45,<2.0
+
+# requests 相关（你给出的版本）
 urllib3==2.2.3
 certifi>=2024.7.4
 charset-normalizer>=3.3.2
