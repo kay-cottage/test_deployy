@@ -9,4 +9,4 @@ COPY . /app
 
 # 生产启动（禁用 Flask reloader，使用 gunicorn）
 ENV PORT=5006
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:5006", "--workers", "2", "--threads", "8", "--timeout", "120"]
+CMD bash -lc 'gunicorn app:app --bind 0.0.0.0:${PORT:-5006} --workers 2 --threads 8 --timeout 120'
