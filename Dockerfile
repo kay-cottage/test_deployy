@@ -1,9 +1,12 @@
-# Dockerfile — 适用于 Render / Railway / Fly.io / 自建服务器
-FROM python:3.11-slim
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+# 官方 Playwright Python 镜像（含浏览器）
+FROM mcr.microsoft.com/playwright/python:v1.45.0-jammy
+
 WORKDIR /app
-COPY requirements.txt .
+COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py .
-EXPOSE 8000
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+COPY . /app
+
+# 生产启动（禁用 Flask reloader，使用 gunicorn）
+ENV PORT=5006
+CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:5006", "--workers", "2", "--threads", "8", "--timeout", "120"]
